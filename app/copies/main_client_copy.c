@@ -1,14 +1,12 @@
 #include "common/socket.h"
 #include "common/protocol.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
-#include <pthread.h>
-#include <stdatomic.h>
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -17,9 +15,19 @@ static void skip_payload(int fd, uint16_t len) {
     uint16_t remaining = len;
     while (remaining > 0) {
         uint16_t chunk = remaining > sizeof(tmp) ? sizeof(tmp) : remaining;
-        if (rw_recv_all(fd, tmp, chunk) < 0) return;
+        if (rw_recv_all(fd, tmp, chunk) < 0) die("rw_recv_all(skip)");
         remaining -= chunk;
     }
+}
+
+static int recv_error_if_any(int fd, uint16_t type, uint16_t len) {
+    if (type == RW_MSG_ERROR && len == sizeof(rw_error_msg_t)) {
+        rw_error_msg_t e;
+        if (rw_recv_all(fd, &e, sizeof(e)) < 0) die("rw_recv_all(error)");
+        fprintf(stderr, "ERROR: code=%d msg=%s\n", e.code, e.msg);
+        return 1;
+    }
+    return 0;
 }
 
 static int read_u32(const char *prompt, uint32_t *out) {
@@ -48,8 +56,10 @@ static void read_string(const char *prompt, char *dst, size_t dst_size) {
         return;
     }
 
+    // remove trailing \n
     size_t n = strcspn(line, "\r\n");
     line[n] = '\0';
+
     snprintf(dst, dst_size, "%s", line);
 }
 
@@ -65,9 +75,11 @@ static void print_defaults(void) {
 static int build_create_req_from_input(rw_create_sim_req_t *req) {
     memset(req, 0, sizeof(*req));
 
-    printf("\n--- CREATE_SIM input ---\n");
-
     print_defaults();
+    
+    uint32_t defaults = 0;
+
+    if (!read_u32("Use defaults? (1 = yes, 0 = no)", &defaults)) return 0;
 
     if (!read_u32("World width w (<=60): ", &req->w)) return 0;
     if (!read_u32("World height h (<=30): ", &req->h)) return 0;
@@ -90,7 +102,7 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
 
     read_string("out_file path: ", req->out_file, sizeof(req->out_file));
 
-    // basic client-side validation
+    // --- client-side validation (same idea as server) ---
     if (req->w == 0 || req->h == 0 || req->w > RW_MAX_W || req->h > RW_MAX_H) {
         fprintf(stderr, "Invalid w/h.\n");
         return 0;
@@ -101,7 +113,8 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
     }
     uint64_t sum = (uint64_t)req->p_up + req->p_down + req->p_left + req->p_right;
     if (sum != RW_PROB_SCALE) {
-        fprintf(stderr, "Probabilities must sum to %u.\n", (unsigned)RW_PROB_SCALE);
+        fprintf(stderr, "Probabilities must sum to %u, got %llu.\n",
+                (unsigned)RW_PROB_SCALE, (unsigned long long)sum);
         return 0;
     }
     if (!(req->world_type == RW_WORLD_WRAP || req->world_type == RW_WORLD_OBSTACLES)) {
@@ -124,124 +137,8 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
     return 1;
 }
 
-typedef struct {
-    int fd;
-    atomic_int mode;       // rw_global_mode_t
-    atomic_int view;       // rw_local_view_t
-    atomic_bool stop;
-} client_ctx_t;
-
-static void *receiver_thread(void *arg) {
-    client_ctx_t *ctx = (client_ctx_t *)arg;
-
-    while (!atomic_load(&ctx->stop)) {
-        uint16_t type = 0, len = 0;
-        if (rw_recv_hdr(ctx->fd, &type, &len) < 0) {
-            fprintf(stderr, "receiver: disconnected\n");
-            atomic_store(&ctx->stop, 1);
-            break;
-        }
-
-        if (type == RW_MSG_STATE && len == sizeof(rw_state_msg_t)) {
-            rw_state_msg_t st;
-            if (rw_recv_all(ctx->fd, &st, sizeof(st)) < 0) {
-                fprintf(stderr, "receiver: read state failed\n");
-                atomic_store(&ctx->stop, 1);
-                break;
-            }
-
-            printf("STATE: %u/%u finished=%u mode=%u w=%u h=%u cell[0]=%u\n",
-                   st.rep_done, st.rep_total, st.finished,
-                   (unsigned)st.mode, st.w, st.h,
-                   st.cell_value[0]);
-
-            if (st.mode == RW_MODE_INTERACTIVE) {
-              printf("PATH len=%u: ", st.path_len);
-              uint32_t show = st.path_len;
-              if (show > 12) show = 12;
-              for (uint32_t i = 0; i < show; i++) {
-                printf("(%d,%d) ", (int)st.path_x[i], (int)st.path_y[i]);
-              }
-              if (st.path_len > show) printf("...");
-              printf("\n");
-}
-
-            if (st.finished) {
-                atomic_store(&ctx->stop, 1);
-                break;
-            }
-        } else if (type == RW_MSG_ERROR && len == sizeof(rw_error_msg_t)) {
-            rw_error_msg_t e;
-            if (rw_recv_all(ctx->fd, &e, sizeof(e)) < 0) {
-                fprintf(stderr, "receiver: read error failed\n");
-            } else {
-                fprintf(stderr, "ERROR: code=%d msg=%s\n", e.code, e.msg);
-            }
-            atomic_store(&ctx->stop, 1);
-            break;
-        } else {
-            // keep stream aligned
-            if (len) skip_payload(ctx->fd, len);
-        }
-    }
-
-    return NULL;
-}
-
-static void *input_thread(void *arg) {
-    client_ctx_t *ctx = (client_ctx_t *)arg;
-
-    printf("\nControls: [m]=toggle mode  [v]=toggle view  [q]=quit\n");
-
-    while (!atomic_load(&ctx->stop)) {
-        int c = getchar();
-        if (c == EOF) {
-            atomic_store(&ctx->stop, 1);
-            break;
-        }
-
-        if (c == '\n' || c == '\r') continue;
-
-        if (c == 'm') {
-            int cur = atomic_load(&ctx->mode);
-            int next = (cur == RW_MODE_SUMMARY) ? RW_MODE_INTERACTIVE : RW_MODE_SUMMARY;
-            atomic_store(&ctx->mode, next);
-
-            rw_set_mode_req_t req = { .mode = (rw_global_mode_t)next };
-            if (rw_send_msg(ctx->fd, RW_MSG_SET_MODE, &req, (uint16_t)sizeof(req)) < 0) {
-                fprintf(stderr, "input: send SET_MODE failed\n");
-                atomic_store(&ctx->stop, 1);
-                break;
-            }
-            printf("client: sent SET_MODE -> %d\n", next);
-        }
-
-        if (c == 'v') {
-            int cur = atomic_load(&ctx->view);
-            int next = (cur == RW_VIEW_AVG_STEPS) ? RW_VIEW_PROB_K : RW_VIEW_AVG_STEPS;
-            atomic_store(&ctx->view, next);
-
-            rw_set_view_req_t req = { .view = (rw_local_view_t)next };
-            if (rw_send_msg(ctx->fd, RW_MSG_SET_VIEW, &req, (uint16_t)sizeof(req)) < 0) {
-                fprintf(stderr, "input: send SET_VIEW failed\n");
-                atomic_store(&ctx->stop, 1);
-                break;
-            }
-            printf("client: sent SET_VIEW -> %d\n", next);
-        }
-
-        if (c == 'q') {
-            atomic_store(&ctx->stop, 1);
-            shutdown(ctx->fd, SHUT_RDWR); // unblock receiver
-            printf("client: quitting...\n");
-            break;
-        }
-    }
-
-    return NULL;
-}
-
 int main(void) {
+    // connect
     int fd = rw_tcp_connect("127.0.0.1", 12345);
     if (fd < 0) die("rw_tcp_connect");
 
@@ -250,9 +147,11 @@ int main(void) {
 
     uint16_t type = 0, len = 0;
     if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(HELLO_ACK)");
+    if (recv_error_if_any(fd, type, len)) { close(fd); return 1; }
+
     if (type != RW_MSG_HELLO_ACK || len != sizeof(rw_hello_ack_t)) {
         fprintf(stderr, "client: expected HELLO_ACK, got type=%u len=%u\n", type, len);
-        if (len) skip_payload(fd, len);
+        skip_payload(fd, len);
         close(fd);
         return 1;
     }
@@ -261,21 +160,25 @@ int main(void) {
     if (rw_recv_all(fd, &hello, sizeof(hello)) < 0) die("rw_recv_all(hello)");
     printf("client: connected client_id=%u\n", hello.client_id);
 
-    // CREATE_SIM
+    // MENU (simple: just create once)
     rw_create_sim_req_t req;
     if (!build_create_req_from_input(&req)) {
-        fprintf(stderr, "client: invalid input\n");
+        fprintf(stderr, "client: invalid input, exiting.\n");
         close(fd);
         return 1;
     }
 
+    // CREATE_SIM
     if (rw_send_msg(fd, RW_MSG_CREATE_SIM, &req, (uint16_t)sizeof(req)) < 0)
         die("rw_send_msg(CREATE_SIM)");
 
+    // CREATE_ACK
     if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(CREATE_ACK)");
+    if (recv_error_if_any(fd, type, len)) { close(fd); return 1; }
+
     if (type != RW_MSG_CREATE_ACK || len != sizeof(rw_create_ack_t)) {
         fprintf(stderr, "client: expected CREATE_ACK, got type=%u len=%u\n", type, len);
-        if (len) skip_payload(fd, len);
+        skip_payload(fd, len);
         close(fd);
         return 1;
     }
@@ -285,21 +188,28 @@ int main(void) {
     printf("client: CREATE_ACK ok=%u sim_id=%u\n", ack.ok, ack.sim_id);
     if (!ack.ok) { close(fd); return 1; }
 
-    // Threads
-    client_ctx_t ctx;
-    ctx.fd = fd;
-    atomic_init(&ctx.mode, (int)req.initial_mode);
-    atomic_init(&ctx.view, (int)RW_VIEW_AVG_STEPS);
-    atomic_init(&ctx.stop, 0);
+    // STATE loop
+    while (1) {
+        if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(loop)");
 
-    pthread_t th_recv, th_in;
-    if (pthread_create(&th_recv, NULL, receiver_thread, &ctx) != 0) die("pthread_create(recv)");
-    if (pthread_create(&th_in, NULL, input_thread, &ctx) != 0) die("pthread_create(input)");
+        if (type == RW_MSG_STATE && len == sizeof(rw_state_msg_t)) {
+            rw_state_msg_t st;
+            if (rw_recv_all(fd, &st, sizeof(st)) < 0) die("rw_recv_all(state)");
 
-    pthread_join(th_recv, NULL);
-    atomic_store(&ctx.stop, 1);
-    shutdown(fd, SHUT_RDWR); // ensure input thread doesn't keep program hanging on recv side
-    pthread_join(th_in, NULL);
+            printf("STATE: %u/%u finished=%u w=%u h=%u mode=%u\n",
+                   st.rep_done, st.rep_total, st.finished, st.w, st.h, (unsigned)st.mode);
+
+            if (st.finished) break;
+        } else if (type == RW_MSG_ERROR && len == sizeof(rw_error_msg_t)) {
+            rw_error_msg_t e;
+            if (rw_recv_all(fd, &e, sizeof(e)) < 0) die("rw_recv_all(error)");
+            fprintf(stderr, "ERROR: code=%d msg=%s\n", e.code, e.msg);
+            break;
+        } else {
+            fprintf(stderr, "client: unexpected msg type=%u len=%u (skipping)\n", type, len);
+            skip_payload(fd, len);
+        }
+    }
 
     close(fd);
     return 0;
