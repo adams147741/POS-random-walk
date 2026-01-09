@@ -53,6 +53,14 @@ static void read_string(const char *prompt, char *dst, size_t dst_size) {
     snprintf(dst, dst_size, "%s", line);
 }
 
+static int read_yes_no(const char *prompt) {
+    printf("%s", prompt);
+    fflush(stdout);
+    int c = getchar();
+    while (c == '\n' || c == '\r') c = getchar();
+    return (c == 'y' || c == 'Y');
+}
+
 static void print_defaults(void) {
     printf("\n--- Defaults (press Enter by typing the same value manually for now) ---\n");
     printf("w=10 h=6 rep_total=20 K=200\n");
@@ -66,31 +74,32 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
     memset(req, 0, sizeof(*req));
 
     printf("\n--- CREATE_SIM input ---\n");
-
     print_defaults();
 
-    if (!read_u32("World width w (<=60): ", &req->w)) return 0;
-    if (!read_u32("World height h (<=30): ", &req->h)) return 0;
-    if (!read_u32("Replications rep_total: ", &req->rep_total)) return 0;
-    if (!read_u32("K (max steps for prob): ", &req->K)) return 0;
+    if (!read_u32("World width w (<=60): ", &req->w)) req->w = 10;
+    if (!read_u32("World height h (<=30): ", &req->h)) req->h = 6;
+    if (!read_u32("Replications rep_total: ", &req->rep_total)) req->rep_total = 20;
+    if (!read_u32("K (max steps for prob): ", &req->K)) req->K = 200;
 
-    if (!read_u32("p_up: ", &req->p_up)) return 0;
-    if (!read_u32("p_down: ", &req->p_down)) return 0;
-    if (!read_u32("p_left: ", &req->p_left)) return 0;
-    if (!read_u32("p_right: ", &req->p_right)) return 0;
+    if (!read_u32("p_up: ", &req->p_up)) req->p_up = 250000;
+    if (!read_u32("p_down: ", &req->p_down)) req->p_down = 250000;
+    if (!read_u32("p_left: ", &req->p_left)) req->p_left = 250000;
+    if (!read_u32("p_right: ", &req->p_right)) req->p_right = 250000;
 
-    uint32_t wt = 0, mode = 0;
-    if (!read_u32("world_type (1=wrap, 2=obstacles): ", &wt)) return 0;
-    if (!read_u32("mode (1=interactive, 2=summary): ", &mode)) return 0;
+    uint32_t wt = 1, mode = 2;
+    if (!read_u32("world_type (1=wrap, 2=obstacles): ", &wt)) wt = 1;
+    if (!read_u32("mode (1=interactive, 2=summary): ", &mode)) mode = 2;
 
     req->world_type = (rw_world_type_t)wt;
     req->initial_mode = (rw_global_mode_t)mode;
 
-    if (!read_u32("obstacle density permille (0..1000): ", &req->obstacle_density_permille)) return 0;
+    if (!read_u32("obstacle density permille (0..1000): ", &req->obstacle_density_permille))
+        req->obstacle_density_permille = 0;
 
     read_string("out_file path: ", req->out_file, sizeof(req->out_file));
+    if (req->out_file[0] == '\0') strcpy(req->out_file, "data/results.output.txt");
 
-    // basic client-side validation
+    // basic validation
     if (req->w == 0 || req->h == 0 || req->w > RW_MAX_W || req->h > RW_MAX_H) {
         fprintf(stderr, "Invalid w/h.\n");
         return 0;
@@ -120,7 +129,6 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
         fprintf(stderr, "out_file must be non-empty.\n");
         return 0;
     }
-
     return 1;
 }
 
@@ -156,15 +164,15 @@ static void *receiver_thread(void *arg) {
                    st.cell_value[0]);
 
             if (st.mode == RW_MODE_INTERACTIVE) {
-              printf("PATH len=%u: ", st.path_len);
-              uint32_t show = st.path_len;
-              if (show > 12) show = 12;
-              for (uint32_t i = 0; i < show; i++) {
-                printf("(%d,%d) ", (int)st.path_x[i], (int)st.path_y[i]);
-              }
-              if (st.path_len > show) printf("...");
-              printf("\n");
-}
+                printf("PATH len=%u: ", st.path_len);
+                uint32_t show = st.path_len;
+                if (show > 12) show = 12;
+                for (uint32_t i = 0; i < show; i++) {
+                    printf("(%d,%d) ", (int)st.path_x[i], (int)st.path_y[i]);
+                }
+                if (st.path_len > show) printf("...");
+                printf("\n");
+            }
 
             if (st.finished) {
                 atomic_store(&ctx->stop, 1);
@@ -174,13 +182,20 @@ static void *receiver_thread(void *arg) {
             rw_error_msg_t e;
             if (rw_recv_all(ctx->fd, &e, sizeof(e)) < 0) {
                 fprintf(stderr, "receiver: read error failed\n");
-            } else {
-                fprintf(stderr, "ERROR: code=%d msg=%s\n", e.code, e.msg);
+                atomic_store(&ctx->stop, 1);
+                break;
             }
+
+            // code==0 -> INFO, do not stop
+            if (e.code == 0) {
+                printf("server info: %s\n", e.msg);
+                continue;
+            }
+
+            fprintf(stderr, "ERROR: code=%d msg=%s\n", e.code, e.msg);
             atomic_store(&ctx->stop, 1);
             break;
         } else {
-            // keep stream aligned
             if (len) skip_payload(ctx->fd, len);
         }
     }
@@ -232,13 +247,37 @@ static void *input_thread(void *arg) {
 
         if (c == 'q') {
             atomic_store(&ctx->stop, 1);
-            shutdown(ctx->fd, SHUT_RDWR); // unblock receiver
+            shutdown(ctx->fd, SHUT_RDWR);
             printf("client: quitting...\n");
             break;
         }
     }
 
     return NULL;
+}
+
+// returns 1 if server says sim exists/running, 0 if not, -1 if no info
+static int recv_server_info(int fd, rw_error_msg_t *out_info) {
+    uint16_t type = 0, len = 0;
+    if (rw_recv_hdr(fd, &type, &len) < 0) return -1;
+
+    if (type == RW_MSG_ERROR && len == sizeof(rw_error_msg_t)) {
+        rw_error_msg_t e;
+        if (rw_recv_all(fd, &e, sizeof(e)) < 0) return -1;
+        if (out_info) *out_info = e;
+
+        if (e.code == 0) {
+            // heuristic: message contains "running"
+            return (strstr(e.msg, "running") != NULL) ? 1 : 0;
+        }
+        // real error
+        fprintf(stderr, "server error: code=%d msg=%s\n", e.code, e.msg);
+        return -1;
+    }
+
+    // unknown, ignore
+    if (len) skip_payload(fd, len);
+    return -1;
 }
 
 int main(void) {
@@ -248,6 +287,7 @@ int main(void) {
     // HELLO
     if (rw_send_msg(fd, RW_MSG_HELLO, NULL, 0) < 0) die("rw_send_msg(HELLO)");
 
+    // HELLO_ACK
     uint16_t type = 0, len = 0;
     if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(HELLO_ACK)");
     if (type != RW_MSG_HELLO_ACK || len != sizeof(rw_hello_ack_t)) {
@@ -261,34 +301,113 @@ int main(void) {
     if (rw_recv_all(fd, &hello, sizeof(hello)) < 0) die("rw_recv_all(hello)");
     printf("client: connected client_id=%u\n", hello.client_id);
 
-    // CREATE_SIM
-    rw_create_sim_req_t req;
-    if (!build_create_req_from_input(&req)) {
-        fprintf(stderr, "client: invalid input\n");
-        close(fd);
-        return 1;
+    // INFO (server sends as RW_MSG_ERROR with code=0)
+    rw_error_msg_t info;
+    printf("waiting for server info");
+    memset(&info, 0, sizeof(info));
+    int sim_running = recv_server_info(fd, &info);
+    if (sim_running >= 0 && info.code == 0) {
+        printf("server info: %s\n", info.msg);
     }
+    printf("server info arrived!");
+    rw_global_mode_t start_mode = RW_MODE_SUMMARY;
 
-    if (rw_send_msg(fd, RW_MSG_CREATE_SIM, &req, (uint16_t)sizeof(req)) < 0)
-        die("rw_send_msg(CREATE_SIM)");
+    if (sim_running == 0) {
+        // no simulation -> must create
+        if (!read_yes_no("No active simulation. Create it now? (y/n): ")) {
+            close(fd);
+            return 0;
+        }
 
-    if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(CREATE_ACK)");
-    if (type != RW_MSG_CREATE_ACK || len != sizeof(rw_create_ack_t)) {
-        fprintf(stderr, "client: expected CREATE_ACK, got type=%u len=%u\n", type, len);
-        if (len) skip_payload(fd, len);
-        close(fd);
-        return 1;
+        rw_create_sim_req_t req;
+        if (!build_create_req_from_input(&req)) {
+            fprintf(stderr, "client: invalid input\n");
+            close(fd);
+            return 1;
+        }
+
+        if (rw_send_msg(fd, RW_MSG_CREATE_SIM, &req, (uint16_t)sizeof(req)) < 0)
+            die("rw_send_msg(CREATE_SIM)");
+
+        if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(CREATE_ACK)");
+        if (type != RW_MSG_CREATE_ACK || len != sizeof(rw_create_ack_t)) {
+            fprintf(stderr, "client: expected CREATE_ACK, got type=%u len=%u\n", type, len);
+            if (len) skip_payload(fd, len);
+            close(fd);
+            return 1;
+        }
+
+        rw_create_ack_t ack;
+        if (rw_recv_all(fd, &ack, sizeof(ack)) < 0) die("rw_recv_all(create_ack)");
+        printf("client: CREATE_ACK ok=%u sim_id=%u\n", ack.ok, ack.sim_id);
+        if (!ack.ok) { close(fd); return 1; }
+
+        start_mode = req.initial_mode;
+    } else if (sim_running == 1) {
+        // sim exists -> confirm join
+        if (!read_yes_no("Simulation is running. Join it now? (y/n): ")) {
+            close(fd);
+            return 0;
+        }
+
+        rw_join_req_t jr = { .sim_id = 1 };
+        if (rw_send_msg(fd, RW_MSG_JOIN_SIM, &jr, (uint16_t)sizeof(jr)) < 0)
+            die("rw_send_msg(JOIN_SIM)");
+
+        if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(JOIN_ACK)");
+        if (type != RW_MSG_JOIN_ACK || len != sizeof(rw_join_ack_t)) {
+            fprintf(stderr, "client: expected JOIN_ACK, got type=%u len=%u\n", type, len);
+            if (len) skip_payload(fd, len);
+            close(fd);
+            return 1;
+        }
+
+        rw_join_ack_t ja;
+        if (rw_recv_all(fd, &ja, sizeof(ja)) < 0) die("rw_recv_all(JOIN_ACK)");
+        if (!ja.ok) {
+            fprintf(stderr, "JOIN denied by server\n");
+            close(fd);
+            return 1;
+        }
+
+        printf("client: joined sim (w=%u h=%u rep_total=%u K=%u mode_now=%u rep_done=%u)\n",
+               ja.w, ja.h, ja.rep_total, ja.K, (unsigned)ja.mode_now, ja.rep_done);
+
+        start_mode = ja.mode_now;
+    } else {
+        // no info / older server -> fallback to create (old behavior)
+        fprintf(stderr, "client: server did not send info; falling back to CREATE\n");
+
+        rw_create_sim_req_t req;
+        if (!build_create_req_from_input(&req)) {
+            fprintf(stderr, "client: invalid input\n");
+            close(fd);
+            return 1;
+        }
+
+        if (rw_send_msg(fd, RW_MSG_CREATE_SIM, &req, (uint16_t)sizeof(req)) < 0)
+            die("rw_send_msg(CREATE_SIM)");
+
+        if (rw_recv_hdr(fd, &type, &len) < 0) die("rw_recv_hdr(CREATE_ACK)");
+        if (type != RW_MSG_CREATE_ACK || len != sizeof(rw_create_ack_t)) {
+            fprintf(stderr, "client: expected CREATE_ACK, got type=%u len=%u\n", type, len);
+            if (len) skip_payload(fd, len);
+            close(fd);
+            return 1;
+        }
+
+        rw_create_ack_t ack;
+        if (rw_recv_all(fd, &ack, sizeof(ack)) < 0) die("rw_recv_all(create_ack)");
+        printf("client: CREATE_ACK ok=%u sim_id=%u\n", ack.ok, ack.sim_id);
+        if (!ack.ok) { close(fd); return 1; }
+
+        start_mode = req.initial_mode;
     }
-
-    rw_create_ack_t ack;
-    if (rw_recv_all(fd, &ack, sizeof(ack)) < 0) die("rw_recv_all(create_ack)");
-    printf("client: CREATE_ACK ok=%u sim_id=%u\n", ack.ok, ack.sim_id);
-    if (!ack.ok) { close(fd); return 1; }
 
     // Threads
     client_ctx_t ctx;
     ctx.fd = fd;
-    atomic_init(&ctx.mode, (int)req.initial_mode);
+    atomic_init(&ctx.mode, (int)start_mode);
     atomic_init(&ctx.view, (int)RW_VIEW_AVG_STEPS);
     atomic_init(&ctx.stop, 0);
 
@@ -298,7 +417,7 @@ int main(void) {
 
     pthread_join(th_recv, NULL);
     atomic_store(&ctx.stop, 1);
-    shutdown(fd, SHUT_RDWR); // ensure input thread doesn't keep program hanging on recv side
+    shutdown(fd, SHUT_RDWR);
     pthread_join(th_in, NULL);
 
     close(fd);
