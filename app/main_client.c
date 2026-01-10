@@ -206,7 +206,7 @@ static void *receiver_thread(void *arg) {
 static void *input_thread(void *arg) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
 
-    printf("\nControls: [m]=toggle mode  [v]=toggle view  [q]=quit\n");
+    printf("\nControls: [m]=toggle mode  [v]=toggle view [s]=stop sim [q]=quit\n");
 
     while (!atomic_load(&ctx->stop)) {
         int c = getchar();
@@ -250,6 +250,16 @@ static void *input_thread(void *arg) {
             shutdown(ctx->fd, SHUT_RDWR);
             printf("client: quitting...\n");
             break;
+        }
+
+        if (c == 's') {
+          rw_stop_req_t req = { .reason = 1};
+          if (rw_send_msg(ctx->fd, RW_MSG_STOP_SIM, &req, (uint16_t)sizeof(req)) < 0) {
+            fprintf(stderr, "input: send STOP_SIM failed\n");
+            atomic_store(&ctx->stop, 1);
+            break;
+          }
+          printf("client: sent STOP_SIM\n");
         }
     }
 
