@@ -200,7 +200,7 @@ static void build_state_for_view(sim_t *S, rw_local_view_t view, rw_state_msg_t 
     st.rep_done = S->rep_done;
     st.rep_total = S->rep_total;
     st.mode = S->mode_global;
-    st.finished = (S->rep_done >= S->rep_total) ? 1u : 0u;
+    st.finished = (S->stop_requested || (S->rep_done >= S->rep_total)) ? 1u : 0u;
 
     // interactive path is same for everyone (last/ongoing traj)
     if (S->mode_global == RW_MODE_INTERACTIVE) {
@@ -326,11 +326,11 @@ static int handle_one_msg(client_t *c, sim_t *S) {
     // HELLO
     if (type == RW_MSG_HELLO && len == 0) {
       if (c->hello_done) return 0;
-      c->hello_done = 1;        
+      c->hello_done = 1;
 
       rw_hello_ack_t ack = {.client_id = c->client_id};
       if (rw_send_msg(c->fd, RW_MSG_HELLO_ACK, &ack, (uint16_t)sizeof(ack)) < 0) return -1;
-      
+
       rw_error_msg_t info;
       memset(&info.msg, 0, sizeof(info.msg));
       info.code = 0;
@@ -342,11 +342,11 @@ static int handle_one_msg(client_t *c, sim_t *S) {
       }
 
       if (rw_send_msg(c->fd, RW_MSG_ERROR, &info, (uint16_t)sizeof(info)) < 0 ) return -1;
-        
+
       return 0;
     }
 
-    
+
     // CREATE_SIM (only if sim not created yet)
     if (type == RW_MSG_CREATE_SIM && len == sizeof(rw_create_sim_req_t)) {
         rw_create_sim_req_t req;
@@ -455,6 +455,13 @@ static int handle_one_msg(client_t *c, sim_t *S) {
     return 0;
 }
 
+static void close_all_clients(client_t clients[MAX_CLIENTS]) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].active) continue;
+        client_close(&clients[i]);
+    }
+}
+
 int main(void) {
     const uint16_t port = 12345;
     int listen_fd = rw_tcp_listen(NULL, port, 16);
@@ -468,6 +475,8 @@ int main(void) {
 
     sim_t sim;
     memset(&sim, 0, sizeof(sim));
+
+    int should_exit = 0;
 
     while (1) {
         // build pollfds: [listen] + active clients
@@ -552,12 +561,16 @@ int main(void) {
         // if finished for the first time -> write results once
         if (sim.created && finished_now && !sim.results_written) {
           if (write_results_to_file(&sim) == 0) {
-          printf("server: results saved to %s\n", sim.out_file);
-        } else {
-          perror("server: write_results_to_file");
-          // aj keď uloženie zlyhá, simuláciu aj tak ukončíme (finished=1)
-          sim.results_written = 1; // aby sa to nepokúšalo zapisovať furt dokola
+            printf("server: results saved to %s\n", sim.out_file);
+          } else {
+            perror("server: write_results_to_file");
+            // aj keď uloženie zlyhá, simuláciu aj tak ukončíme (finished=1)
+            sim.results_written = 1; // aby sa to nepokúšalo zapisovať furt dokola
+            }
         }
+
+        if (sim.created && finished_now) {
+            should_exit = 1;
         }
 
         // broadcast to all joined clients
@@ -575,9 +588,14 @@ int main(void) {
              }
           }
       }
+        if (should_exit) {
+            printf("server: shutting down (simulation finished)\n");
+            close_all_clients(clients);
+            close(listen_fd);
+            break;
+        }
   }
 
     close(listen_fd);
     return 0;
 }
-

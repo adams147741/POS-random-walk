@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <poll.h>
+#include <math.h>
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -21,6 +23,133 @@ static void skip_payload(int fd, uint16_t len) {
         remaining -= chunk;
     }
 }
+
+#include <math.h>   // ak nechceš, dá sa aj bez
+
+static void render_interactive(const rw_state_msg_t *st) {
+    const uint32_t w = st->w, h = st->h;
+
+    // buffer znakov: h riadkov, každý w znakov
+    char grid[RW_MAX_H][RW_MAX_W];
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+            grid[y][x] = '.';
+
+    // obstacles (ak zatiaľ neposielaš, bude to všade 0)
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t i = y * RW_MAX_W + x;
+            if (st->obstacle[i]) grid[y][x] = '#';
+        }
+    }
+
+    // goal
+    if (w > 0 && h > 0) grid[0][0] = 'G';
+
+    // path
+    uint32_t n = st->path_len;
+    for (uint32_t i = 0; i < n; i++) {
+        int x = st->path_x[i];
+        int y = st->path_y[i];
+        if (x < 0 || y < 0) continue;
+        if ((uint32_t)x >= w || (uint32_t)y >= h) continue;
+
+        // neprepisuj goal
+        if (x == 0 && y == 0) continue;
+
+        grid[y][x] = '*';
+    }
+
+    // current position = posledný bod pathu
+    if (n > 0) {
+        int cx = st->path_x[n - 1];
+        int cy = st->path_y[n - 1];
+        if (cx >= 0 && cy >= 0 && (uint32_t)cx < w && (uint32_t)cy < h) {
+            if (!(cx == 0 && cy == 0)) grid[cy][cx] = '@';
+        }
+    }
+
+    // print
+    printf("\n");
+    printf("INTERACTIVE (rep %u/%u)  finished=%u\n", st->rep_done, st->rep_total, st->finished);
+
+    // y-axis top->bottom (0..h-1)
+    for (uint32_t y = 0; y < h; y++) {
+        printf("%2u | ", y);
+        for (uint32_t x = 0; x < w; x++) putchar(grid[y][x]);
+        printf("\n");
+    }
+
+    // x labels
+    printf("    + ");
+    for (uint32_t x = 0; x < w; x++) putchar('-');
+    printf("\n     ");
+    for (uint32_t x = 0; x < w; x++) putchar((char)('0' + (x % 10)));
+    printf("\n");
+}
+
+static int digits_u32(uint32_t v) {
+    int d = 1;
+    while (v >= 10) { v /= 10; d++; }
+    return d;
+}
+
+static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
+    const uint32_t w = st->w, h = st->h;
+
+    printf("\n");
+    printf("SUMMARY (rep %u/%u) finished=%u  view=%s\n",
+           st->rep_done, st->rep_total, st->finished,
+           (view == RW_VIEW_AVG_STEPS) ? "AVG_STEPS" : "PROB_K");
+
+    // zistíme šírku stĺpca (aby to bolo zarovnané)
+    int colw = 4; // minimum
+    if (view == RW_VIEW_AVG_STEPS) {
+        // hodnoty sú avg*1000 -> my zobrazíme celé kroky
+        uint32_t maxv = 0;
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                uint32_t i = y * RW_MAX_W + x;
+                uint32_t steps = st->cell_value[i] / 1000u;
+                if (steps > maxv) maxv = steps;
+            }
+        colw = digits_u32(maxv);
+        if (colw < 3) colw = 3;
+        if (colw > 7) colw = 7; // aby to nebolo obrovské
+    } else {
+        // percentá 0..100
+        colw = 4; // napr. "100%"
+    }
+
+    // header x
+    printf("    ");
+    for (uint32_t x = 0; x < w; x++) {
+        printf(" %*u", colw, x);
+    }
+    printf("\n");
+
+    for (uint32_t y = 0; y < h; y++) {
+        printf("%2u |", y);
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t i = y * RW_MAX_W + x;
+
+            if (view == RW_VIEW_AVG_STEPS) {
+                uint32_t steps = st->cell_value[i] / 1000u;
+                printf(" %*u", colw, steps);
+            } else {
+                // 0..RW_PROB_SCALE
+                uint32_t p = st->cell_value[i];
+                uint32_t pct = (uint32_t)((uint64_t)p * 100u / RW_PROB_SCALE);
+                // zarovnané napr "  7%"
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%u%%", pct);
+                printf(" %*s", colw, buf);
+            }
+        }
+        printf("\n");
+    }
+}
+
 
 static int read_u32(const char *prompt, uint32_t *out) {
     char line[128];
@@ -157,11 +286,23 @@ static void *receiver_thread(void *arg) {
                 atomic_store(&ctx->stop, 1);
                 break;
             }
-
-            printf("STATE: %u/%u finished=%u mode=%u w=%u h=%u cell[0]=%u\n",
+            
+            /*            printf("STATE: %u/%u finished=%u mode=%u w=%u h=%u cell[0]=%u\n",
                    st.rep_done, st.rep_total, st.finished,
                    (unsigned)st.mode, st.w, st.h,
                    st.cell_value[0]);
+            
+            */
+            atomic_store(&ctx->mode, (int)st.mode);
+
+            rw_local_view_t view = (rw_local_view_t)atomic_load(&ctx->view);
+
+            if (st.mode == RW_MODE_INTERACTIVE) {
+                render_interactive(&st);
+            } else {
+                render_summary(&st, view);
+            }
+
 
             if (st.mode == RW_MODE_INTERACTIVE) {
                 printf("PATH len=%u: ", st.path_len);
@@ -176,6 +317,8 @@ static void *receiver_thread(void *arg) {
 
             if (st.finished) {
                 atomic_store(&ctx->stop, 1);
+                shutdown(ctx->fd, SHUT_RDWR);
+                printf("Simulation stopped/finished. Quitting!\n");
                 break;
             }
         } else if (type == RW_MSG_ERROR && len == sizeof(rw_error_msg_t)) {
@@ -206,63 +349,78 @@ static void *receiver_thread(void *arg) {
 static void *input_thread(void *arg) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
 
-    printf("\nControls: [m]=toggle mode  [v]=toggle view [s]=stop sim [q]=quit\n");
+    printf("\nControls: [m]=toggle mode  [v]=toggle view  [s]=stop sim  [q]=quit\n");
+    fflush(stdout);
+
+    struct pollfd pfd;
+    pfd.fd = STDIN_FILENO;
+    pfd.events = POLLIN;
 
     while (!atomic_load(&ctx->stop)) {
-        int c = getchar();
-        if (c == EOF) {
+        int rc = poll(&pfd, 1, 100); // 100ms timeout
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            perror("poll(stdin)");
             atomic_store(&ctx->stop, 1);
             break;
         }
+        if (rc == 0) {
+            continue; // timeout, skontroluj stop znova
+        }
 
-        if (c == '\n' || c == '\r') continue;
-
-        if (c == 'm') {
-            int cur = atomic_load(&ctx->mode);
-            int next = (cur == RW_MODE_SUMMARY) ? RW_MODE_INTERACTIVE : RW_MODE_SUMMARY;
-            atomic_store(&ctx->mode, next);
-
-            rw_set_mode_req_t req = { .mode = (rw_global_mode_t)next };
-            if (rw_send_msg(ctx->fd, RW_MSG_SET_MODE, &req, (uint16_t)sizeof(req)) < 0) {
-                fprintf(stderr, "input: send SET_MODE failed\n");
+        if (pfd.revents & POLLIN) {
+            int c = getchar();
+            if (c == EOF) {
                 atomic_store(&ctx->stop, 1);
                 break;
             }
-            printf("client: sent SET_MODE -> %d\n", next);
-        }
+            if (c == '\n' || c == '\r') continue;
 
-        if (c == 'v') {
-            int cur = atomic_load(&ctx->view);
-            int next = (cur == RW_VIEW_AVG_STEPS) ? RW_VIEW_PROB_K : RW_VIEW_AVG_STEPS;
-            atomic_store(&ctx->view, next);
+            if (c == 'm') {
+                int cur = atomic_load(&ctx->mode);
+                int next = (cur == RW_MODE_SUMMARY) ? RW_MODE_INTERACTIVE : RW_MODE_SUMMARY;
+                // neposúvaj ctx.mode tu naslepo; nech to aktualizuje receiver zo STATE
+                rw_set_mode_req_t req = { .mode = (rw_global_mode_t)next };
+                if (rw_send_msg(ctx->fd, RW_MSG_SET_MODE, &req, (uint16_t)sizeof(req)) < 0) {
+                    fprintf(stderr, "input: send SET_MODE failed\n");
+                    atomic_store(&ctx->stop, 1);
+                    break;
+                }
+                printf("client: sent SET_MODE -> %d\n", next);
+            }
 
-            rw_set_view_req_t req = { .view = (rw_local_view_t)next };
-            if (rw_send_msg(ctx->fd, RW_MSG_SET_VIEW, &req, (uint16_t)sizeof(req)) < 0) {
-                fprintf(stderr, "input: send SET_VIEW failed\n");
+            if (c == 'v') {
+                int cur = atomic_load(&ctx->view);
+                int next = (cur == RW_VIEW_AVG_STEPS) ? RW_VIEW_PROB_K : RW_VIEW_AVG_STEPS;
+                atomic_store(&ctx->view, next);
+
+                rw_set_view_req_t req = { .view = (rw_local_view_t)next };
+                if (rw_send_msg(ctx->fd, RW_MSG_SET_VIEW, &req, (uint16_t)sizeof(req)) < 0) {
+                    fprintf(stderr, "input: send SET_VIEW failed\n");
+                    atomic_store(&ctx->stop, 1);
+                    break;
+                }
+                printf("client: sent SET_VIEW -> %d\n", next);
+            }
+
+            if (c == 's') {
+                rw_stop_req_t req = { .reason = 1 };
+                if (rw_send_msg(ctx->fd, RW_MSG_STOP_SIM, &req, (uint16_t)sizeof(req)) < 0) {
+                    fprintf(stderr, "input: send STOP_SIM failed\n");
+                    atomic_store(&ctx->stop, 1);
+                    break;
+                }
+                printf("client: sent STOP_SIM\n");
+            }
+
+            if (c == 'q') {
                 atomic_store(&ctx->stop, 1);
+                shutdown(ctx->fd, SHUT_RDWR);
+                printf("client: quitting...\n");
                 break;
             }
-            printf("client: sent SET_VIEW -> %d\n", next);
-        }
-
-        if (c == 'q') {
-            atomic_store(&ctx->stop, 1);
-            shutdown(ctx->fd, SHUT_RDWR);
-            printf("client: quitting...\n");
-            break;
-        }
-
-        if (c == 's') {
-          rw_stop_req_t req = { .reason = 1};
-          if (rw_send_msg(ctx->fd, RW_MSG_STOP_SIM, &req, (uint16_t)sizeof(req)) < 0) {
-            fprintf(stderr, "input: send STOP_SIM failed\n");
-            atomic_store(&ctx->stop, 1);
-            break;
-          }
-          printf("client: sent STOP_SIM\n");
         }
     }
-
     return NULL;
 }
 
@@ -433,4 +591,3 @@ int main(void) {
     close(fd);
     return 0;
 }
-
