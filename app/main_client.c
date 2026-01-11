@@ -339,6 +339,11 @@ static void *receiver_thread(void *arg) {
                 continue;
             }
 
+            if (e.code == 71) {
+                printf("server info: %s\n", e.msg);
+                continue;
+            }
+
             fprintf(stderr, "ERROR: code=%d msg=%s\n", e.code, e.msg);
             atomic_store(&ctx->stop, 1);
             break;
