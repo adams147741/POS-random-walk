@@ -97,6 +97,11 @@ typedef struct {
     int16_t path_x[RW_MAX_PATH];
     int16_t path_y[RW_MAX_PATH];
 
+    //TODO: added this so I can only store visited cells not the whole path.
+    int16_t visited_x[RW_MAX_W];
+    int16_t visited_y[RW_MAX_H];
+    uint32_t samples[RW_MAX_H * RW_MAX_W];
+
     // creator id
     uint32_t creator_id;
 
@@ -143,6 +148,7 @@ static void start_traj(sim_t *S) {
 static void finish_traj_advance(sim_t *S, uint32_t steps_to_hit, int hit_within_k) {
     uint32_t i = idx(S->cur_cell_x, S->cur_cell_y);
     S->steps_sum[i] += steps_to_hit;
+    S->samples[i]++;
     if (hit_within_k) S->hit_k_count[i]++;
 
     // advance cell
@@ -229,7 +235,7 @@ static void build_state_for_view(sim_t *S, rw_local_view_t view, rw_state_msg_t 
         for (uint32_t y = 0; y < st.h; y++) {
             for (uint32_t x = 0; x < st.w; x++) {
                 uint32_t i = idx(x, y);
-                uint64_t avg = S->steps_sum[i] / (uint64_t)S->rep_done;
+                uint64_t avg = S->steps_sum[i] / (uint64_t)S->samples[i];
                 st.cell_value[i] = (uint32_t)(avg * 1000ULL);
             }
         }
@@ -237,7 +243,7 @@ static void build_state_for_view(sim_t *S, rw_local_view_t view, rw_state_msg_t 
         for (uint32_t y = 0; y < st.h; y++) {
             for (uint32_t x = 0; x < st.w; x++) {
                 uint32_t i = idx(x, y);
-                uint32_t prob = (uint32_t)((uint64_t)S->hit_k_count[i] * RW_PROB_SCALE / S->rep_done);
+                uint32_t prob = (uint32_t)((uint64_t)S->hit_k_count[i] * RW_PROB_SCALE / S->samples[i]);
                 st.cell_value[i] = prob;
             }
         }
@@ -260,33 +266,35 @@ static int write_results_to_file(sim_t *S) {
             S->w, S->h, S->K, S->rep_done, S->rep_total);
     fprintf(f, "# Prob scale: %u\n\n", (unsigned)RW_PROB_SCALE);
 
-    // AVG_STEPS (plain steps, not *1000)
-    fprintf(f, "[AVG_STEPS]\n");
-    for (uint32_t y = 0; y < S->h; y++) {
-        for (uint32_t x = 0; x < S->w; x++) {
-            uint32_t i = idx(x, y);
-            double avg = 0.0;
-            if (S->rep_done > 0) {
-                avg = (double)S->steps_sum[i] / (double)S->rep_done;
-            }
-            fprintf(f, "%.3f%s", avg, (x + 1 == S->w) ? "" : " ");
+    // AVG_STEPS
+fprintf(f, "[AVG_STEPS]\n");
+for (uint32_t y = 0; y < S->h; y++) {
+    for (uint32_t x = 0; x < S->w; x++) {
+        uint32_t i = idx(x, y);
+        double avg = 0.0;
+        uint32_t s = (uint32_t)S->samples[i];
+        if (s > 0) {
+            avg = (double)S->steps_sum[i] / (double)s;
         }
-        fprintf(f, "\n");
+        fprintf(f, "%.3f%s", avg, (x + 1 == S->w) ? "" : " ");
     }
+    fprintf(f, "\n");
+}
 
-    // PROB_K (0..1)
-    fprintf(f, "\n[PROB_K]\n");
-    for (uint32_t y = 0; y < S->h; y++) {
-        for (uint32_t x = 0; x < S->w; x++) {
-            uint32_t i = idx(x, y);
-            double p = 0.0;
-            if (S->rep_done > 0) {
-                p = (double)S->hit_k_count[i] / (double)S->rep_done;
-            }
-            fprintf(f, "%.6f%s", p, (x + 1 == S->w) ? "" : " ");
+// PROB_K
+fprintf(f, "\n[PROB_K]\n");
+for (uint32_t y = 0; y < S->h; y++) {
+    for (uint32_t x = 0; x < S->w; x++) {
+        uint32_t i = idx(x, y);
+        double p = 0.0;
+        uint32_t s = (uint32_t)S->samples[i];
+        if (s > 0) {
+            p = (double)S->hit_k_count[i] / (double)s;
         }
-        fprintf(f, "\n");
+        fprintf(f, "%.6f%s", p, (x + 1 == S->w) ? "" : " ");
     }
+    fprintf(f, "\n");
+}
 
     fclose(f);
     S->results_written = 1;

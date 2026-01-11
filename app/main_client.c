@@ -137,7 +137,7 @@ static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
             } else {
                 // 0..RW_PROB_SCALE
                 uint32_t p = st->cell_value[i];
-                uint32_t pct = (uint32_t)((uint64_t)p /**100u*/ / RW_PROB_SCALE);
+                uint32_t pct = (uint32_t)((uint64_t)p *100u / RW_PROB_SCALE);
                 // zarovnané napr "  7%"
                 char buf[8];
                 snprintf(buf, sizeof(buf), "%u%%", pct);
@@ -203,6 +203,8 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
     printf("\n--- CREATE_SIM input ---\n");
     print_defaults();
 
+    uint32_t mt = 0;
+    read_u32("", &mt);
     if (!read_u32("World width w (<=60): ", &req->w)) req->w = 10;
     if (!read_u32("World height h (<=30): ", &req->h)) req->h = 6;
     if (!read_u32("Replications rep_total: ", &req->rep_total)) req->rep_total = 20;
