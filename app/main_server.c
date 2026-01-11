@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <time.h>
+#include <getopt.h>
 
 #define MAX_CLIENTS 16
 #define TICK_MS 200
@@ -97,9 +98,7 @@ typedef struct {
     int16_t path_x[RW_MAX_PATH];
     int16_t path_y[RW_MAX_PATH];
 
-    //TODO: added this so I can only store visited cells not the whole path.
-    int16_t visited_x[RW_MAX_W];
-    int16_t visited_y[RW_MAX_H];
+    // represents how many replications were started from specific cell
     uint32_t samples[RW_MAX_H * RW_MAX_W];
 
     // creator id
@@ -470,8 +469,31 @@ static void close_all_clients(client_t clients[MAX_CLIENTS]) {
     }
 }
 
-int main(void) {
-    const uint16_t port = 12345;
+int main(int argc, char **argv) {
+    uint16_t port = 12345;
+
+    static struct option long_opts[] = {
+        {"port", required_argument, 0, 'p'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "p:", long_opts, NULL)) != -1) {
+        switch (opt) {
+            case 'p': {
+                long v = strtol(optarg, NULL, 10);
+                if (v <= 0 || v > 65535) {
+                    fprintf(stderr, "server: invalid port: %s\n", optarg);
+                    return 1;
+                }
+                port = (uint16_t)v;
+                break;
+            }
+            default:
+                fprintf(stderr, "Usage: %s [--port N]\n", argv[0]);
+                return 1;
+        }
+    }
     int listen_fd = rw_tcp_listen(NULL, port, 16);
     if (listen_fd < 0) die("rw_tcp_listen");
 

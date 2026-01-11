@@ -11,6 +11,10 @@
 #include <stdatomic.h>
 #include <poll.h>
 #include <math.h>
+#include <getopt.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -448,9 +452,93 @@ static int recv_server_info(int fd, rw_error_msg_t *out_info) {
     return -1;
 }
 
-int main(void) {
+static int spawn_server(uint16_t port) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+
+    if (pid == 0) {
+        // child: exec ./server --port <port>
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+
+        char *argv[] = { "./server", "--port", port_str, NULL };
+        execv(argv[0], argv);
+
+        // ak exec zlyha
+        perror("execv(./server)");
+        _exit(127);
+    }
+
+    // parent: neblokuj, server beží v pozadí
+    return 0;
+}
+
+static int connect_or_spawn(const char *host, uint16_t port) {
+    int fd = rw_tcp_connect(host, port);
+    if (fd >= 0) return fd;
+
+    // ak sa pripájame na localhost a nebeží server, skús ho spustiť
+    // (ak host nie je localhost, radšej nespúšťaj lokálny server)
+    if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0) {
+        if (spawn_server(port) < 0) {
+            perror("spawn_server");
+            return -1;
+        }
+    } else {
+        // vzdialený host: nespúšťame lokálny server
+        return -1;
+    }
+
+    // retry connect (napr. 2 sekundy dokopy)
+    for (int attempt = 0; attempt < 20; attempt++) {
+        usleep(100 * 1000); // 100ms
+        fd = rw_tcp_connect(host, port);
+        if (fd >= 0) return fd;
+    }
+
+    errno = ECONNREFUSED;
+    return -1;
+}
+
+int main(int argc, char **argv) {
+
+        const char *host = "127.0.0.1";
+    uint16_t port = 12345;
+
+    static struct option long_opts[] = {
+        {"host", required_argument, 0, 'h'},
+        {"port", required_argument, 0, 'p'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "h:p:", long_opts, NULL)) != -1) {
+        switch (opt) {
+            case 'h':
+                host = optarg;
+                break;
+            case 'p': {
+                long v = strtol(optarg, NULL, 10);
+                if (v <= 0 || v > 65535) {
+                    fprintf(stderr, "client: invalid port: %s\n", optarg);
+                    return 1;
+                }
+                port = (uint16_t)v;
+                break;
+            }
+            default:
+                fprintf(stderr, "Usage: %s [--host HOST] [--port N]\n", argv[0]);
+                return 1;
+        }
+    }
+
+    int fd = connect_or_spawn(host, port);
+    if (fd < 0) die("connect_or_spawn");
+
+    /*
     int fd = rw_tcp_connect("127.0.0.1", 12345);
     if (fd < 0) die("rw_tcp_connect");
+    */
 
     // HELLO
     if (rw_send_msg(fd, RW_MSG_HELLO, NULL, 0) < 0) die("rw_send_msg(HELLO)");
