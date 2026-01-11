@@ -24,8 +24,6 @@ static void skip_payload(int fd, uint16_t len) {
     }
 }
 
-#include <math.h>   // ak nechceš, dá sa aj bez
-
 static void render_interactive(const rw_state_msg_t *st) {
     const uint32_t w = st->w, h = st->h;
 
@@ -139,7 +137,7 @@ static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
             } else {
                 // 0..RW_PROB_SCALE
                 uint32_t p = st->cell_value[i];
-                uint32_t pct = (uint32_t)((uint64_t)p * 100u / RW_PROB_SCALE);
+                uint32_t pct = (uint32_t)((uint64_t)p /**100u*/ / RW_PROB_SCALE);
                 // zarovnané napr "  7%"
                 char buf[8];
                 snprintf(buf, sizeof(buf), "%u%%", pct);
@@ -226,7 +224,7 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
         req->obstacle_density_permille = 0;
 
     read_string("out_file path: ", req->out_file, sizeof(req->out_file));
-    if (req->out_file[0] == '\0') strcpy(req->out_file, "data/results.output.txt");
+    if (req->out_file[0] == '\0') strcpy(req->out_file, "data/results/out.txt");
 
     // basic validation
     if (req->w == 0 || req->h == 0 || req->w > RW_MAX_W || req->h > RW_MAX_H) {
