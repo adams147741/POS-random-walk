@@ -229,13 +229,13 @@ static int build_create_req_from_input(rw_create_sim_req_t *req) {
     if (!read_u32("p_right: ", &req->p_right)) req->p_right = 250000;
 
     uint32_t wt = 1, mode = 2;
-    if (!read_u32("world_type (1=wrap, 2=obstacles): ", &wt)) wt = 1;
+    if (!read_u32("world_type (1=wrap): ", &wt)) wt = 1;
     if (!read_u32("mode (1=interactive, 2=summary): ", &mode)) mode = 2;
 
     req->world_type = (rw_world_type_t)wt;
     req->initial_mode = (rw_global_mode_t)mode;
 
-    if (!read_u32("obstacle density permille (0..1000): ", &req->obstacle_density_permille))
+    /*if (!read_u32("obstacle density permille (0..1000): ", &req->obstacle_density_permille))*/
         req->obstacle_density_permille = 0;
 
     read_string("out_file path: ", req->out_file, sizeof(req->out_file));
