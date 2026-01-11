@@ -7,4 +7,3 @@ target_include_directories(rw_common PUBLIC
 )
 
 target_compile_options(rw_common PRIVATE -Wall -Wextra -Wpedantic)
-

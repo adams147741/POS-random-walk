@@ -15,8 +15,11 @@
 #define MAX_CLIENTS 16
 #define TICK_MS 200
 
+//Prints a system error message (via perror) and terminates the server process immediately.
+// Used for failures the server can’t recover from (e.g., listen socket setup, poll failure).
 static void die(const char *msg) { perror(msg); exit(1); }
 
+//Packs an error code + short text into an RW_MSG_ERROR message and sends it to a client using the common message framing (header + payload).
 static int send_error(int fd, int32_t code, const char *msg) {
     rw_error_msg_t e;
     memset(&e, 0, sizeof(e));
@@ -25,6 +28,8 @@ static int send_error(int fd, int32_t code, const char *msg) {
     return rw_send_msg(fd, RW_MSG_ERROR, &e, (uint16_t)sizeof(e));
 }
 
+//Reads and discards len bytes from the socket. 
+//This keeps the stream aligned when the server receives an unknown message type or payload it doesn’t want to parse.
 static void skip_payload(int fd, uint16_t len) {
     char tmp[1024];
     uint16_t remaining = len;
@@ -35,9 +40,11 @@ static void skip_payload(int fd, uint16_t len) {
     }
 }
 
+//Converts 2D coordinates (x, y) into a 1D array index for the grid-based buffers (cell statistics, obstacles, etc.).
 static inline uint32_t idx(uint32_t x, uint32_t y) { return y * RW_MAX_W + x; }
 
-// ---- Random walk core (wrap) ----
+//Randomly selects a movement direction (up/down/left/right) according to the configured probabilities.
+//Uses rand_r with a per-simulation seed so the simulation can run without global RNG state.
 static int pick_dir(uint32_t p_up, uint32_t p_down, uint32_t p_left, uint32_t p_right, unsigned int *seed) {
     uint32_t r = (uint32_t)(rand_r(seed) % RW_PROB_SCALE);
     uint32_t c = 0;
@@ -48,6 +55,8 @@ static int pick_dir(uint32_t p_up, uint32_t p_down, uint32_t p_left, uint32_t p_
     return 3;
 }
 
+//Applies one movement step in the chosen direction and wraps around the edges 
+//(“world without obstacles” wrap behavior: going off one side reappears on the opposite side).
 static void step_wrap(uint32_t w, uint32_t h, int *x, int *y, int dir) {
     int nx = *x, ny = *y;
     switch (dir) {
@@ -109,6 +118,9 @@ typedef struct {
     int results_written;
 } sim_t;
 
+
+//Initializes a new simulation from the CREATE request: 
+//copies world size, probabilities, K, replication count, mode, output filename, and records who created the simulation.
 static void sim_init(sim_t *S, const rw_create_sim_req_t *req, uint32_t creator_id) {
     memset(S, 0, sizeof(*S));
     S->created = 1;
@@ -130,6 +142,7 @@ static void sim_init(sim_t *S, const rw_create_sim_req_t *req, uint32_t creator_
     S->results_written = 0;
 }
 
+//Starts a new walk from the current starting cell, resets the step counter, and begins recording the trajectory for interactive display.
 static void start_traj(sim_t *S) {
     S->tx = (int)S->cur_cell_x;
     S->ty = (int)S->cur_cell_y;
@@ -144,6 +157,8 @@ static void start_traj(sim_t *S) {
     }
 }
 
+//Finalizes one walk result for the current starting cell (stores steps-to-center, updates hit-within-K stats), 
+//then advances to the next cell and tracks when a full-grid replication is complete.
 static void finish_traj_advance(sim_t *S, uint32_t steps_to_hit, int hit_within_k) {
     uint32_t i = idx(S->cur_cell_x, S->cur_cell_y);
     S->steps_sum[i] += steps_to_hit;
@@ -164,6 +179,8 @@ static void finish_traj_advance(sim_t *S, uint32_t steps_to_hit, int hit_within_
     S->traj_active = 0;
 }
 
+//Advances the simulation by a limited “budget” of steps. In interactive mode it moves slowly (so clients can see the path), 
+//and in summary mode it runs faster. Stops a trajectory as soon as it reaches the center [0,0].
 static void sim_do_steps(sim_t *S, uint32_t budget) {
     if (!S->created) return;
     if (S->rep_done >= S->rep_total) return;
@@ -195,7 +212,8 @@ static void sim_do_steps(sim_t *S, uint32_t budget) {
     }
 }
 
-// build state for a given view
+// Builds a RW_MSG_STATE snapshot for a client: progress, mode, finished flag, optional trajectory path (interactive mode),
+// and the per-cell values depending on the client’s chosen view (average steps vs probability of reaching center within K).
 static void build_state_for_view(sim_t *S, rw_local_view_t view, rw_state_msg_t *st_out) {
     rw_state_msg_t st;
     memset(&st, 0, sizeof(st));
@@ -251,7 +269,8 @@ static void build_state_for_view(sim_t *S, rw_local_view_t view, rw_state_msg_t 
     *st_out = st;
 }
 
-
+//Writes the final results into the requested output file in two sections: average steps per cell and probability-to-hit-within-K per cell.
+// Ensures results are written only once.
 static int write_results_to_file(sim_t *S) {
     if (!S->created) return -1;
     if (S->results_written) return 0;
@@ -311,11 +330,14 @@ typedef struct {
     rw_local_view_t view;
 } client_t;
 
+//Closes a client socket (if active) and clears the client slot so it can be reused.
 static void client_close(client_t *c) {
     if (c->active) close(c->fd);
     memset(c, 0, sizeof(*c));
 }
 
+//Validates a CREATE_SIM request: checks world bounds, probability sum, replication/K values, 
+//and that the initial mode is one of the supported modes.
 static int validate_create(const rw_create_sim_req_t *r) {
     if (r->w == 0 || r->h == 0) return 0;
     if (r->w > RW_MAX_W || r->h > RW_MAX_H) return 0;
@@ -326,6 +348,8 @@ static int validate_create(const rw_create_sim_req_t *r) {
     return 1;
 }
 
+//Reads a single framed message from a client and handles protocol actions (HELLO, CREATE_SIM, JOIN_SIM, SET_MODE, STOP_SIM, SET_VIEW). 
+//For unknown messages, discards the payload to keep the connection usable.
 static int handle_one_msg(client_t *c, sim_t *S) {
     uint16_t type = 0, len = 0;
     if (rw_recv_hdr(c->fd, &type, &len) < 0) return -1;
@@ -462,6 +486,7 @@ static int handle_one_msg(client_t *c, sim_t *S) {
     return 0;
 }
 
+//Iterates through all client slots and cleanly closes any active connections.
 static void close_all_clients(client_t clients[MAX_CLIENTS]) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].active) continue;
@@ -469,6 +494,9 @@ static void close_all_clients(client_t clients[MAX_CLIENTS]) {
     }
 }
 
+//Parses command-line options (port), starts the listening socket, manages multiple clients with poll,
+// runs the simulation in timed ticks, broadcasts state updates to joined clients, writes results when finished, 
+//and shuts down when the simulation ends.
 int main(int argc, char **argv) {
     uint16_t port = 12345;
 
@@ -594,8 +622,8 @@ int main(int argc, char **argv) {
             printf("server: results saved to %s\n", sim.out_file);
           } else {
             perror("server: write_results_to_file");
-            // aj keď uloženie zlyhá, simuláciu aj tak ukončíme (finished=1)
-            sim.results_written = 1; // aby sa to nepokúšalo zapisovať furt dokola
+            // if saving failes, we end the simulation anyway and set the results to written so it can end
+            sim.results_written = 1;
             }
         }
 
@@ -611,7 +639,7 @@ int main(int argc, char **argv) {
             rw_state_msg_t st;
             build_state_for_view(&sim, clients[i].view, &st);
 
-            // NOTE: st.finished už bude 1, ak stop_requested alebo rep_done>=rep_total
+            // NOTE: st.finished will be 1, if stop_requested or rep_done>=rep_total
             if (rw_send_msg(clients[i].fd, RW_MSG_STATE, &st, (uint16_t)sizeof(st)) < 0) {
               printf("server: drop client %u (send failed)\n", clients[i].client_id);
               client_close(&clients[i]);

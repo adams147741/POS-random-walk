@@ -16,8 +16,10 @@
 #include <sys/wait.h>
 #include <time.h>
 
+//Prints the reason of a fatal failure and exits the client immediately. Used when continuing would leave the client in a broken state.
 static void die(const char *msg) { perror(msg); exit(1); }
 
+//Reads and discards a payload of len bytes so the client stays in sync with the message stream when it receives an unexpected message.
 static void skip_payload(int fd, uint16_t len) {
     char tmp[1024];
     uint16_t remaining = len;
@@ -28,16 +30,18 @@ static void skip_payload(int fd, uint16_t len) {
     }
 }
 
+//Draws an ASCII “live” view of the random walk: empty cells as ., obstacles as #, the goal [0,0] as G, the path as *,
+// and the current walker position as @.
 static void render_interactive(const rw_state_msg_t *st) {
     const uint32_t w = st->w, h = st->h;
 
-    // buffer znakov: h riadkov, každý w znakov
+    // character buffer: h rows, each w characters
     char grid[RW_MAX_H][RW_MAX_W];
     for (uint32_t y = 0; y < h; y++)
         for (uint32_t x = 0; x < w; x++)
             grid[y][x] = '.';
 
-    // obstacles (ak zatiaľ neposielaš, bude to všade 0)
+    // obstacles not implemented :(
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
             uint32_t i = y * RW_MAX_W + x;
@@ -56,13 +60,13 @@ static void render_interactive(const rw_state_msg_t *st) {
         if (x < 0 || y < 0) continue;
         if ((uint32_t)x >= w || (uint32_t)y >= h) continue;
 
-        // neprepisuj goal
+        //dont overwrite the goal
         if (x == 0 && y == 0) continue;
 
         grid[y][x] = '*';
     }
 
-    // current position = posledný bod pathu
+    // current position = last point in path
     if (n > 0) {
         int cx = st->path_x[n - 1];
         int cy = st->path_y[n - 1];
@@ -90,12 +94,15 @@ static void render_interactive(const rw_state_msg_t *st) {
     printf("\n");
 }
 
+//Returns how many decimal digits are needed to print a uint32_t. Used to format tables nicely.
 static int digits_u32(uint32_t v) {
     int d = 1;
     while (v >= 10) { v /= 10; d++; }
     return d;
 }
 
+//Prints the grid as a table in “summary mode”, either showing average steps-to-goal per starting cell or
+// the probability of reaching the goal within K steps.
 static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
     const uint32_t w = st->w, h = st->h;
 
@@ -104,10 +111,9 @@ static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
            st->rep_done, st->rep_total, st->finished,
            (view == RW_VIEW_AVG_STEPS) ? "AVG_STEPS" : "PROB_K");
 
-    // zistíme šírku stĺpca (aby to bolo zarovnané)
-    int colw = 4; // minimum
+    int colw = 4;
     if (view == RW_VIEW_AVG_STEPS) {
-        // hodnoty sú avg*1000 -> my zobrazíme celé kroky
+        // values are avg*1000
         uint32_t maxv = 0;
         for (uint32_t y = 0; y < h; y++)
             for (uint32_t x = 0; x < w; x++) {
@@ -117,10 +123,9 @@ static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
             }
         colw = digits_u32(maxv);
         if (colw < 3) colw = 3;
-        if (colw > 7) colw = 7; // aby to nebolo obrovské
+        if (colw > 7) colw = 7;
     } else {
-        // percentá 0..100
-        colw = 4; // napr. "100%"
+        colw = 4;
     }
 
     // header x
@@ -142,7 +147,6 @@ static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
                 // 0..RW_PROB_SCALE
                 uint32_t p = st->cell_value[i];
                 uint32_t pct = (uint32_t)((uint64_t)p *100u / RW_PROB_SCALE);
-                // zarovnané napr "  7%"
                 char buf[8];
                 snprintf(buf, sizeof(buf), "%u%%", pct);
                 printf(" %*s", colw, buf);
@@ -152,7 +156,7 @@ static void render_summary(const rw_state_msg_t *st, rw_local_view_t view) {
     }
 }
 
-
+//Prompts the user and reads an unsigned integer from stdin. Returns success/failure so callers can fall back to defaults.
 static int read_u32(const char *prompt, uint32_t *out) {
     char line[128];
     printf("%s", prompt);
@@ -169,6 +173,7 @@ static int read_u32(const char *prompt, uint32_t *out) {
     return 1;
 }
 
+//Prompts the user and reads a line of text (e.g., output file path), trimming the newline.
 static void read_string(const char *prompt, char *dst, size_t dst_size) {
     char line[256];
     printf("%s", prompt);
@@ -184,6 +189,7 @@ static void read_string(const char *prompt, char *dst, size_t dst_size) {
     snprintf(dst, dst_size, "%s", line);
 }
 
+//Asks a yes/no question and returns true for y/Y. Used for confirming create/join/quit actions.
 static int read_yes_no(const char *prompt) {
     printf("%s", prompt);
     fflush(stdout);
@@ -192,6 +198,7 @@ static int read_yes_no(const char *prompt) {
     return (c == 'y' || c == 'Y');
 }
 
+//Prints the default simulation parameters so the user knows what values will be used if they just hit Enter or provide invalid input.
 static void print_defaults(void) {
     printf("\n--- Defaults (press Enter by typing the same value manually for now) ---\n");
     printf("w=10 h=6 rep_total=20 K=200\n");
@@ -201,6 +208,8 @@ static void print_defaults(void) {
     printf("---------------------------------------------------------------\n\n");
 }
 
+//Collects simulation settings from the user, fills a CREATE_SIM request struct, 
+//and performs basic validation (grid size, probability sum, K, replication count, mode/world type, obstacle density, output file).
 static int build_create_req_from_input(rw_create_sim_req_t *req) {
     memset(req, 0, sizeof(*req));
 
@@ -272,6 +281,9 @@ typedef struct {
     atomic_bool stop;
 } client_ctx_t;
 
+
+//Background thread that continuously reads messages from the server, updates local mode state, 
+//renders incoming STATE updates, prints server errors/info messages, and stops the client when the simulation finishes or the connection drops.
 static void *receiver_thread(void *arg) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
 
@@ -355,6 +367,8 @@ static void *receiver_thread(void *arg) {
     return NULL;
 }
 
+//Handles keyboard controls without blocking the receiver: sends SET_MODE, SET_VIEW, STOP_SIM, 
+//or quits based on single-key commands using poll() on stdin.
 static void *input_thread(void *arg) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
 
@@ -374,7 +388,7 @@ static void *input_thread(void *arg) {
             break;
         }
         if (rc == 0) {
-            continue; // timeout, skontroluj stop znova
+            continue;
         }
 
         if (pfd.revents & POLLIN) {
@@ -388,7 +402,6 @@ static void *input_thread(void *arg) {
             if (c == 'm') {
                 int cur = atomic_load(&ctx->mode);
                 int next = (cur == RW_MODE_SUMMARY) ? RW_MODE_INTERACTIVE : RW_MODE_SUMMARY;
-                // neposúvaj ctx.mode tu naslepo; nech to aktualizuje receiver zo STATE
                 rw_set_mode_req_t req = { .mode = (rw_global_mode_t)next };
                 if (rw_send_msg(ctx->fd, RW_MSG_SET_MODE, &req, (uint16_t)sizeof(req)) < 0) {
                     fprintf(stderr, "input: send SET_MODE failed\n");
@@ -433,7 +446,8 @@ static void *input_thread(void *arg) {
     return NULL;
 }
 
-// returns 1 if server says sim exists/running, 0 if not, -1 if no info
+//Reads the server’s post-HELLO informational message (sent as RW_MSG_ERROR with code=0) and guesses whether 
+//a simulation is already running, so the client knows whether to create or join.
 static int recv_server_info(int fd, rw_error_msg_t *out_info) {
     uint16_t type = 0, len = 0;
     if (rw_recv_hdr(fd, &type, &len) < 0) return -1;
@@ -457,6 +471,8 @@ static int recv_server_info(int fd, rw_error_msg_t *out_info) {
     return -1;
 }
 
+//Forks and execs a local ./server process on the chosen port, 
+//so a client can conveniently start the server automatically when connecting to localhost.
 static int spawn_server(uint16_t port) {
     pid_t pid = fork();
     if (pid < 0) return -1;
@@ -469,32 +485,34 @@ static int spawn_server(uint16_t port) {
         char *argv[] = { "./server", "--port", port_str, NULL };
         execv(argv[0], argv);
 
-        // ak exec zlyha
+       
         perror("execv(./server)");
         _exit(127);
     }
 
-    // parent: neblokuj, server beží v pozadí
+   
     return 0;
 }
 
+//Tries to connect to the server; if it fails and the host is local, 
+//it attempts to start the server and retries for a short time before giving up.
 static int connect_or_spawn(const char *host, uint16_t port) {
     int fd = rw_tcp_connect(host, port);
     if (fd >= 0) return fd;
 
-    // ak sa pripájame na localhost a nebeží server, skús ho spustiť
-    // (ak host nie je localhost, radšej nespúšťaj lokálny server)
+    // if connecting to localhost and it is not running, try to run it
+    // if not localhost, dont run localhost
     if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0) {
         if (spawn_server(port) < 0) {
             perror("spawn_server");
             return -1;
         }
     } else {
-        // vzdialený host: nespúšťame lokálny server
+        //remote client
         return -1;
     }
 
-    // retry connect (napr. 2 sekundy dokopy)
+    // retry connect
     for (int attempt = 0; attempt < 20; attempt++) {
         usleep(100 * 1000); // 100ms
         fd = rw_tcp_connect(host, port);
@@ -505,6 +523,9 @@ static int connect_or_spawn(const char *host, uint16_t port) {
     return -1;
 }
 
+//Parses command-line options (host/port), connects (or starts a local server), performs the HELLO handshake, 
+//decides whether to CREATE or JOIN a simulation based on server info and user choice, 
+//then starts the receiver/input threads and cleanly shuts down when the simulation ends or the user quits.
 int main(int argc, char **argv) {
 
         const char *host = "127.0.0.1";
@@ -564,13 +585,11 @@ int main(int argc, char **argv) {
 
     // INFO (server sends as RW_MSG_ERROR with code=0)
     rw_error_msg_t info;
-    printf("waiting for server info");
     memset(&info, 0, sizeof(info));
     int sim_running = recv_server_info(fd, &info);
     if (sim_running >= 0 && info.code == 0) {
         printf("server info: %s\n", info.msg);
     }
-    printf("server info arrived!");
     rw_global_mode_t start_mode = RW_MODE_SUMMARY;
 
     if (sim_running == 0) {

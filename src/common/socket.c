@@ -14,13 +14,15 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+//Enables SO_REUSEADDR on a socket so the address can be reused immediately after the socket is closed,
+// which avoids “address already in use” errors when restarting a server.
 static int set_reuseaddr(int fd) {
     int yes = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) return -1;
     return 0;
 }
 
-// Returns 0 on success, -1 on error.
+// Sends the entire buffer over a socket, retrying as needed until all bytes are written or an error occurs.
 int rw_send_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = (const unsigned char *)buf;
     size_t sent = 0;
@@ -31,7 +33,7 @@ int rw_send_all(int fd, const void *buf, size_t len) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (n == 0) { // should not happen for send(), but handle defensively
+        if (n == 0) {
             errno = ECONNRESET;
             return -1;
         }
@@ -40,7 +42,7 @@ int rw_send_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-// Returns 0 on success, -1 on error.
+// Receives an exact number of bytes from a socket, blocking and retrying until the buffer is fully filled or the connection fails.
 int rw_recv_all(int fd, void *buf, size_t len) {
     unsigned char *p = (unsigned char *)buf;
     size_t recvd = 0;
@@ -60,6 +62,7 @@ int rw_recv_all(int fd, void *buf, size_t len) {
     return 0;
 }
 
+//Sends a protocol message consisting of a fixed-size header followed by an optional payload, converting fields to network byte order for portability.
 int rw_send_msg(int fd, uint16_t type, const void *payload, uint16_t payload_len) {
     rw_msg_hdr_t hdr;
     // Put header into network byte order so it works across machines too
@@ -78,6 +81,7 @@ int rw_send_msg(int fd, uint16_t type, const void *payload, uint16_t payload_len
     return 0;
 }
 
+//Receives and decodes a message header from the socket, converting fields from network byte order into host format.
 int rw_recv_hdr(int fd, uint16_t *type_out, uint16_t *len_out) {
     rw_msg_hdr_t hdr;
     if (rw_recv_all(fd, &hdr, sizeof(hdr)) < 0) return -1;
@@ -90,6 +94,7 @@ int rw_recv_hdr(int fd, uint16_t *type_out, uint16_t *len_out) {
     return 0;
 }
 
+//Creates a TCP listening socket on the given host and port, automatically handling IPv4/IPv6 and returning the first address that successfully binds and listens.
 int rw_tcp_listen(const char *listen_host, uint16_t port, int backlog) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
@@ -138,6 +143,7 @@ int rw_tcp_listen(const char *listen_host, uint16_t port, int backlog) {
     return listen_fd;
 }
 
+//Connects to a remote TCP server using hostname and port, trying all resolved IPv4/IPv6 addresses until a connection succeeds.
 int rw_tcp_connect(const char *connect_host, uint16_t port) {
     if (connect_host == NULL || connect_host[0] == '\0') {
         errno = EINVAL;
